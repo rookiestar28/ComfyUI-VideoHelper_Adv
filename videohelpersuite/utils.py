@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from typing import Iterable
 import shutil
@@ -21,6 +22,14 @@ BIGMAX = (2**53-1)
 DIMMAX = 8192
 
 ENCODE_ARGS = ("utf-8", 'backslashreplace')
+
+def env_flag(name: str, default: bool=False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+VHS_DEBUG = env_flag("VHS_DEBUG", False)
 
 def ffmpeg_suitability(path):
     try:
@@ -99,6 +108,29 @@ if gifski_path is None:
         gifski_path = shutil.which("gifski")
 ytdl_path = os.environ.get("VHS_YTDL", None) or shutil.which('yt-dlp') \
         or shutil.which('youtube-dl')
+ffprobe_path = shutil.which("ffprobe")
+
+def get_capability_summary():
+    return {
+        "debug": VHS_DEBUG,
+        "ffmpeg": ffmpeg_path,
+        "ffprobe": ffprobe_path,
+        "gifski": gifski_path,
+        "strict_paths": env_flag("VHS_STRICT_PATHS", False),
+        "ytdl": ytdl_path,
+    }
+
+def debug_log(event: str, **payload):
+    if not VHS_DEBUG:
+        return
+    if payload:
+        summary = json.dumps(payload, ensure_ascii=True, default=str, sort_keys=True)
+        logger.info(f"[VHS DEBUG] {event}: {summary}")
+    else:
+        logger.info(f"[VHS DEBUG] {event}")
+
+debug_log("capabilities", **get_capability_summary())
+
 download_history = {}
 def try_download_video(url):
     if ytdl_path is None:

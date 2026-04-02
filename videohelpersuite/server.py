@@ -5,14 +5,45 @@ import subprocess
 import re
 
 import asyncio
-import av
+try:
+    # IMPORTANT: keep this optional so the node package can still load without PyAV.
+    import av
+except ImportError:
+    av = None
 
+from .logger import logger
 from .utils import is_url, get_sorted_dir_files_from_directory, ffmpeg_path, \
-        validate_sequence, is_safe_path, strip_path, try_download_video, ENCODE_ARGS
+        validate_sequence, is_safe_path, strip_path, try_download_video, ENCODE_ARGS, \
+        debug_log
 from comfy.k_diffusion.utils import FolderOfImages
 
 
 web = server.web
+
+
+def error_response(status, message):
+    debug_log("server_error", status=status, message=message)
+    return web.Response(status=status, text=message)
+
+
+def parse_int(query, key, default=0, minimum=None):
+    try:
+        value = int(float(query.get(key, default)))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def parse_float(query, key, default=0.0, minimum=None):
+    try:
+        value = float(query.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
 
 @server.PromptServer.instance.routes.get("/vhs/viewvideo")
 @server.PromptServer.instance.routes.get("/viewvideo")
@@ -27,16 +58,17 @@ async def view_video(request):
         #Don't just return file, that provides  arbitrary read access to any file
         if is_safe_path(output_dir, strict=True):
             return web.FileResponse(path=file)
+        return error_response(503, "ffmpeg is unavailable and the requested preview path is not allowed for direct file serving.")
 
-    frame_rate = query.get('frame_rate', 8)
+    frame_rate = parse_float(query, 'frame_rate', 8.0, 0.0)
     if query.get('format', 'video') == "folder":
         os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
         concat_file = os.path.join(folder_paths.get_temp_directory(), "image_sequence_preview.txt")
-        skip_first_images = int(query.get('skip_first_images', 0))
-        select_every_nth = int(query.get('select_every_nth', 1)) or 1
+        skip_first_images = parse_int(query, 'skip_first_images', 0, 0)
+        select_every_nth = parse_int(query, 'select_every_nth', 1, 1)
         valid_images = get_sorted_dir_files_from_directory(file, skip_first_images, select_every_nth, FolderOfImages.IMG_EXTENSIONS)
         if len(valid_images) == 0:
-            return web.Response(status=204)
+            return error_response(204, "No valid images were found for folder preview.")
         with open(concat_file, "w") as f:
             f.write("ffconcat version 1.0\n")
             for path in valid_images:
@@ -67,13 +99,13 @@ async def view_video(request):
                 + e.stderr.decode(*ENCODE_ARGS))
         return web.Response(status=500)
     vfilters = []
-    target_rate = float(query.get('force_rate', 0)) or base_fps
-    modified_rate = target_rate / (float(query.get('select_every_nth',1)) or 1)
+    target_rate = parse_float(query, 'force_rate', 0.0, 0.0) or base_fps
+    modified_rate = target_rate / parse_int(query, 'select_every_nth', 1, 1)
     start_time = 0
     if 'start_time' in query:
-        start_time = float(query['start_time'])
-    elif float(query.get('skip_first_frames', 0)) > 0:
-        start_time = float(query.get('skip_first_frames'))/target_rate
+        start_time = parse_float(query, 'start_time', 0.0, 0.0)
+    elif parse_float(query, 'skip_first_frames', 0.0, 0.0) > 0:
+        start_time = parse_float(query, 'skip_first_frames', 0.0, 0.0)/target_rate
         if start_time > 1/modified_rate:
             start_time += 1/modified_rate
     if start_time > 0:
@@ -104,8 +136,9 @@ async def view_video(request):
         vfilters.append(f"scale={size}")
     if len(vfilters) > 0:
         args += ["-vf", ",".join(vfilters)]
-    if float(query.get('frame_load_cap', 0)) > 0:
-        args += ["-frames:v", query['frame_load_cap'].split('.')[0]]
+    frame_cap = parse_int(query, 'frame_load_cap', 0, 0)
+    if frame_cap > 0:
+        args += ["-frames:v", str(frame_cap)]
     #TODO:reconsider adding high frame cap/setting default frame cap on node
     if query.get('deadline', 'realtime') == 'good':
         deadline = 'good'
@@ -115,6 +148,7 @@ async def view_video(request):
     args += ['-c:v', 'libvpx-vp9','-deadline', deadline, '-cpu-used', '8', '-f', 'webm', '-']
 
     try:
+        debug_log("view_video_preview", filename=filename, args=args)
         proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE,
                                                     stdin=subprocess.DEVNULL)
         try:
@@ -142,14 +176,16 @@ async def view_audio(request):
         #Don't just return file, that provides  arbitrary read access to any file
         if is_safe_path(output_dir, strict=True):
             return web.FileResponse(path=file)
+        return error_response(503, "ffmpeg is unavailable and the requested audio preview path is not allowed for direct file serving.")
 
     in_args = ["-i", file]
     start_time = 0
     if 'start_time' in query:
-        start_time = float(query['start_time'])
+        start_time = parse_float(query, 'start_time', 0.0, 0.0)
     args = [ffmpeg_path, "-v", "error", '-vn'] + in_args + ['-ss', str(start_time)]
-    if float(query.get('duration', 0)) > 0:
-        args += ['-t', str(query['duration'])]
+    duration = parse_float(query, 'duration', 0.0, 0.0)
+    if duration > 0:
+        args += ['-t', str(duration)]
     if query.get('deadline', 'realtime') == 'good':
         deadline = 'good'
     else:
@@ -157,6 +193,7 @@ async def view_audio(request):
 
     args += ['-c:a', 'libopus','-deadline', deadline, '-cpu-used', '8', '-f', 'webm', '-']
     try:
+        debug_log("view_audio_preview", filename=filename, args=args)
         proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE,
                                                     stdin=subprocess.DEVNULL)
         try:
@@ -186,6 +223,8 @@ async def query_video(request):
     if filepath.endswith(".webp"):
         # ffmpeg doesn't support decoding animated WebP https://trac.ffmpeg.org/ticket/4907
         return web.json_response({})
+    if av is None:
+        return web.json_response({"error": "PyAV is not installed; video metadata probing is unavailable."}, status=503)
     if filepath in query_cache and query_cache[filepath][0] == os.stat(filepath).st_mtime:
         source = query_cache[filepath][1]
     else:
@@ -209,28 +248,39 @@ async def query_video(request):
                 source['alpha'] = 'a' in frame.format.name
                 source['frames'] = stream.metadata.get('NUMBER_OF_FRAMES', round(source['duration'] * source['fps']))
                 query_cache[filepath] = (os.stat(filepath).st_mtime, source)
-        except Exception:
-            pass
+        except Exception as exc:
+            debug_log("query_video_failed", filepath=filepath, error=str(exc))
     if not 'frames' in source:
-        return web.json_response({})
+        return web.json_response({"error": "Failed to read video metadata."}, status=422)
     loaded = {}
-    loaded['duration'] = source['duration']
-    loaded['duration'] -= float(query.get('start_time',0))
-    loaded['fps'] = float(query.get('force_rate', 0)) or source.get('fps',1)
-    loaded['duration'] -= int(query.get('skip_first_frames', 0)) / loaded['fps']
-    loaded['fps'] /= int(query.get('select_every_nth', 1)) or 1
-    loaded['frames'] = round(loaded['duration'] * loaded['fps'])
+    loaded['duration'] = max(0.0, source['duration'] - parse_float(query, 'start_time', 0.0, 0.0))
+    loaded['fps'] = parse_float(query, 'force_rate', 0.0, 0.0) or source.get('fps',1)
+    if loaded['fps'] <= 0:
+        loaded['fps'] = source.get('fps', 1) or 1
+    loaded['duration'] = max(0.0, loaded['duration'] - parse_int(query, 'skip_first_frames', 0, 0) / loaded['fps'])
+    loaded['fps'] /= parse_int(query, 'select_every_nth', 1, 1)
+    loaded['frames'] = max(0, round(loaded['duration'] * loaded['fps']))
+    debug_log("query_video", filepath=filepath, source=source, loaded=loaded)
     return web.json_response({'source': source, 'loaded': loaded})
 
 async def resolve_path(query):
     if "filename" not in query:
-        return web.Response(status=204)
-    filename = query["filename"]
+        return error_response(400, "Missing required query parameter: filename")
+    filename = strip_path(query["filename"])
+    if not filename:
+        return error_response(400, "Empty filename.")
 
     #Path code misformats urls on windows and must be skipped
     if is_url(filename):
-        file = await asyncio.to_thread(try_download_video, filename) or file
-        filname, output_dir = os.path.split(file)
+        try:
+            file = await asyncio.to_thread(try_download_video, filename)
+        except Exception as exc:
+            debug_log("resolve_path_url_failed", source=filename, error=str(exc))
+            return error_response(502, f"Failed to download media from URL: {filename}")
+        if not file:
+            return error_response(502, f"Failed to download media from URL: {filename}")
+        output_dir, _ = os.path.split(file)
+        debug_log("resolve_path_url", source=filename, resolved=file)
         return file, filename, output_dir
     else:
         filename, output_dir = folder_paths.annotated_filepath(filename)
@@ -244,10 +294,10 @@ async def resolve_path(query):
             output_dir = folder_paths.get_directory_by_type(type)
 
         if output_dir is None:
-            return web.Response(status=204)
+            return error_response(404, f"Unknown media directory type: {type}")
 
         if not is_safe_path(output_dir):
-            return web.Response(status=204)
+            return error_response(403, f"Unsafe media directory: {output_dir}")
 
         if "subfolder" in query:
             output_dir = os.path.join(output_dir, query["subfolder"])
@@ -256,13 +306,14 @@ async def resolve_path(query):
         file = os.path.join(output_dir, filename)
 
         if not os.path.exists(file):
-            return web.Response(status=204)
+            return error_response(404, f"Media file not found: {file}")
         if query.get('format', 'video') == 'folder':
             if not os.path.isdir(file):
-                return web.Response(status=204)
+                return error_response(422, f"Expected a directory for folder preview: {file}")
         else:
             if not os.path.isfile(file) and not validate_sequence(file):
-                    return web.Response(status=204)
+                    return error_response(422, f"Media path is not a file or valid sequence: {file}")
+        debug_log("resolve_path_local", filename=filename, output_dir=output_dir, resolved=file, type=type)
         return file, filename, output_dir
 
 @server.PromptServer.instance.routes.get("/vhs/getpath")
@@ -279,6 +330,12 @@ async def get_path(request):
 
     #Use get so None is default instead of keyerror
     valid_extensions = query.get("extensions")
+    if valid_extensions:
+        valid_extensions = {
+            ext.strip().lower().lstrip(".")
+            for ext in valid_extensions.split(",")
+            if ext.strip()
+        }
     valid_items = []
     for item in os.scandir(path):
         try:

@@ -23,7 +23,7 @@ from .batched_nodes import VAEEncodeBatched, VAEDecodeBatched
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, \
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
-        ContainsAll
+        ContainsAll, debug_log
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -128,6 +128,25 @@ def tensor_to_shorts(tensor):
     return tensor_to_int(tensor, 16).astype(np.uint16)
 def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
+
+
+def build_audio_mux_args(video_format, file_path, output_file_with_audio_path, audio, total_frames_output, frame_rate):
+    if "audio_pass" not in video_format:
+        logger.warn("Selected video format does not have explicit audio support")
+        video_format["audio_pass"] = ["-c:a", "libopus"]
+    channels = audio['waveform'].size(1)
+    min_audio_dur = total_frames_output / frame_rate + 1
+    if video_format.get('trim_to_audio', 'False') != 'False':
+        apad = []
+    else:
+        apad = ["-af", "apad=whole_dur="+str(min_audio_dur)]
+    mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
+                "-ar", str(audio['sample_rate']), "-ac", str(channels),
+                "-f", "f32le", "-i", "-", "-c:v", "copy"] \
+                + video_format["audio_pass"] \
+                + apad + ["-shortest", output_file_with_audio_path]
+    merge_filter_args(mux_args, '-af')
+    return mux_args, channels
 
 def ffmpeg_process(args, video_format, video_metadata, file_path, env):
 
@@ -387,13 +406,15 @@ class VideoCombine:
         # save first frame as png to keep metadata
         first_image_file = f"{filename}_{counter:05}.png"
         file_path = os.path.join(full_output_folder, first_image_file)
+        saved_workflow_image = False
         if extra_options.get('VHS_MetadataImage', True) != False:
             Image.fromarray(tensor_to_bytes(first_image)).save(
                 file_path,
                 pnginfo=metadata,
                 compress_level=4,
             )
-        output_files.append(file_path)
+            output_files.append(file_path)
+            saved_workflow_image = True
 
         format_type, format_ext = format.split("/")
         if format_type == "image":
@@ -564,10 +585,6 @@ class VideoCombine:
                 #batch is unfinished
                 #TODO: Check if empty output breaks other custom nodes
                 return {"ui": {"unfinished_batch": [True]}, "result": ((save_output, []),)}
-
-            output_files.append(file_path)
-
-
             a_waveform = None
             if audio is not None:
                 try:
@@ -575,45 +592,41 @@ class VideoCombine:
                     a_waveform = audio['waveform']
                 except:
                     pass
+            final_output_path = file_path
+            final_output_name = file
             if a_waveform is not None:
                 # Create audio file if input was provided
                 output_file_with_audio = f"{filename}_{counter:05}-audio.{video_format['extension']}"
                 output_file_with_audio_path = os.path.join(full_output_folder, output_file_with_audio)
-                if "audio_pass" not in video_format:
-                    logger.warn("Selected video format does not have explicit audio support")
-                    video_format["audio_pass"] = ["-c:a", "libopus"]
-
-
-                # FFmpeg command with audio re-encoding
-                #TODO: expose audio quality options if format widgets makes it in
-                #Reconsider forcing apad/shortest
-                channels = audio['waveform'].size(1)
-                min_audio_dur = total_frames_output / frame_rate + 1
-                if video_format.get('trim_to_audio', 'False') != 'False':
-                    apad = []
-                else:
-                    apad = ["-af", "apad=whole_dur="+str(min_audio_dur)]
-                mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
-                            "-ar", str(audio['sample_rate']), "-ac", str(channels),
-                            "-f", "f32le", "-i", "-", "-c:v", "copy"] \
-                            + video_format["audio_pass"] \
-                            + apad + ["-shortest", output_file_with_audio_path]
-
+                mux_args, channels = build_audio_mux_args(
+                    video_format,
+                    file_path,
+                    output_file_with_audio_path,
+                    audio,
+                    total_frames_output,
+                    frame_rate,
+                )
                 audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
                         .numpy().tobytes()
-                merge_filter_args(mux_args, '-af')
                 try:
                     res = subprocess.run(mux_args, input=audio_data,
                                          env=env, capture_output=True, check=True)
                 except subprocess.CalledProcessError as e:
-                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
-                            + e.stderr.decode(*ENCODE_ARGS))
+                    raise Exception(
+                        "An error occured while muxing audio into the video output:\n"
+                        + f"format={video_format['extension']} codec_args={video_format.get('audio_pass')} "
+                        + f"sample_rate={audio['sample_rate']} channels={channels}\n"
+                        + e.stderr.decode(*ENCODE_ARGS)
+                    )
                 if res.stderr:
                     print(res.stderr.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-                output_files.append(output_file_with_audio_path)
-                #Return this file with audio to the webui.
-                #It will be muted unless opened or saved with right click
-                file = output_file_with_audio
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                debug_log("video_mux_complete", silent_path=file_path, muxed_path=output_file_with_audio_path)
+                final_output_path = output_file_with_audio_path
+                final_output_name = output_file_with_audio
+            output_files.append(final_output_path)
+            file = final_output_name
         if extra_options.get('VHS_KeepIntermediate', True) == False:
             for intermediate in output_files[1:-1]:
                 if os.path.exists(intermediate):
@@ -624,9 +637,10 @@ class VideoCombine:
                 "type": "output" if save_output else "temp",
                 "format": format,
                 "frame_rate": frame_rate,
-                "workflow": first_image_file,
                 "fullpath": output_files[-1],
             }
+        if saved_workflow_image:
+            preview["workflow"] = first_image_file
         if num_frames == 1 and 'png' in format and '%03d' in file:
             preview['format'] = 'image/png'
             preview['filename'] = file.replace('%03d', '001')
@@ -655,7 +669,10 @@ class LoadAudio:
         if audio_file is None or validate_path(audio_file) != True:
             raise Exception("audio_file is not a valid path: " + audio_file)
         if is_url(audio_file):
-            audio_file = try_download_video(audio_file) or audio_file
+            downloaded = try_download_video(audio_file)
+            if downloaded is None:
+                raise Exception("audio_file URL could not be downloaded: " + audio_file)
+            audio_file = downloaded
         #Eagerly fetch the audio since the user must be using it if the
         #node executes, unlike Load Video
         audio = get_audio(audio_file, start_time=seek_seconds, duration=duration)
@@ -795,7 +812,7 @@ class PruneOutputs:
     def prune_outputs(self, filenames, options):
         if len(filenames[1]) == 0:
             return ()
-        assert(len(filenames[1]) <= 3 and len(filenames[1]) >= 2)
+        assert(len(filenames[1]) <= 3 and len(filenames[1]) >= 1)
         delete_list = []
         if options in ["Intermediate", "Intermediate and Utility", "All"]:
             delete_list += filenames[1][1:-1]

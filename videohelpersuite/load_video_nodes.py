@@ -4,7 +4,11 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 import cv2
-import psutil
+try:
+    # IMPORTANT: keep this optional so the node module still imports in minimal environments.
+    import psutil
+except ImportError:
+    psutil = None
 import subprocess
 import re
 import time
@@ -16,7 +20,7 @@ from comfy.k_diffusion.utils import FolderOfImages
 from .logger import logger
 from .utils import BIGMAX, DIMMAX, calculate_file_hash, get_sorted_dir_files_from_directory,\
         lazy_get_audio, hash_path, validate_path, strip_path, try_download_video,  \
-        is_url, imageOrLatent, ffmpeg_path, ENCODE_ARGS, floatOrInt
+        is_url, imageOrLatent, ffmpeg_path, ENCODE_ARGS, floatOrInt, debug_log
 
 
 video_extensions = ['webm', 'mp4', 'mkv', 'gif', 'mov']
@@ -74,23 +78,36 @@ def target_size(width, height, custom_width, custom_height, downscale_ratio=8) -
     height = int(height/downscale_ratio + 0.5) * downscale_ratio
     return (width, height)
 
+
+def raise_video_error(video, reason):
+    raise RuntimeError(f"Failed to load video '{video}': {reason}")
+
+
+def estimate_frame_memory(width, height, channels, multiplier=2.0):
+    return max(1, int(width * height * channels * 4 * multiplier))
+
 def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
                        select_every_nth, meta_batch=None, unique_id=None):
     video_cap = cv2.VideoCapture(video)
     if not video_cap.isOpened() or not video_cap.grab():
-        raise ValueError(f"{video} could not be loaded with cv.")
+        video_cap.release()
+        raise_video_error(video, "OpenCV could not open or decode the source.")
 
     # extract video metadata
     fps = video_cap.get(cv2.CAP_PROP_FPS)
     width = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps
+    if fps <= 0:
+        video_cap.release()
+        raise_video_error(video, f"Invalid FPS reported by OpenCV: {fps}")
+    duration = total_frames / fps if total_frames > 0 else 0
 
-    width = 0
-
-    if width <=0 or height <=0:
-        _, frame = video_cap.retrieve()
+    if width <= 0 or height <= 0:
+        ok, frame = video_cap.retrieve()
+        if not ok or frame is None:
+            video_cap.release()
+            raise_video_error(video, "OpenCV failed to read the first frame for metadata probing.")
         height, width, _ = frame.shape
 
     # set video_cap to look at start_index frame
@@ -144,6 +161,8 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
         # follow up: can videos ever have an alpha channel?
         # To my testing: No. opencv has no support for alpha
         unused, frame = video_cap.retrieve()
+        if not unused or frame is None:
+            break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # convert frame to comfyui's expected format
         # TODO: frame contains no exif information. Check if opencv2 has already applied
@@ -164,12 +183,15 @@ def cv_frame_generator(video, force_rate, frame_load_cap, skip_first_frames,
     if meta_batch is not None:
         meta_batch.inputs.pop(unique_id)
         meta_batch.has_closed_inputs = True
+    video_cap.release()
     if prev_frame is not None:
         yield prev_frame
 
 def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
                            custom_width, custom_height, downscale_ratio=8,
                            meta_batch=None, unique_id=None):
+    if ffmpeg_path is None:
+        raise_video_error(video, "ffmpeg is unavailable.")
     args_input = ["-i", video]
     args_dummy = [ffmpeg_path] + args_input +['-c', 'copy', '-frames:v', '1', "-f", "null", "-"]
     size_base = None
@@ -326,6 +348,7 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
     if meta_batch is None or unique_id not in meta_batch.inputs:
         gen = generator(meta_batch=meta_batch, unique_id=unique_id, downscale_ratio=downscale_ratio, **kwargs)
         (width, height, fps, duration, total_frames, target_frame_time, yieldable_frames, new_width, new_height, alpha) = next(gen)
+        debug_log("load_video_probe", video=kwargs['video'], width=width, height=height, fps=fps, duration=duration, total_frames=total_frames, loaded_width=new_width, loaded_height=new_height, alpha=alpha)
 
         if meta_batch is not None:
             meta_batch.inputs[unique_id] = (gen, width, height, fps, duration, total_frames, target_frame_time, yieldable_frames, new_width, new_height, alpha)
@@ -337,22 +360,26 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
 
     memory_limit = None
     if memory_limit_mb is not None:
-        memory_limit *= 2 ** 20
+        memory_limit = int(memory_limit_mb * (2 ** 20))
     else:
         #TODO: verify if garbage collection should be performed here.
         #leaves ~128 MB unreserved for safety
         try:
+            if psutil is None:
+                raise RuntimeError("psutil is unavailable")
             memory_limit = (psutil.virtual_memory().available + psutil.swap_memory().free) - 2 ** 27
-        except:
+        except Exception as exc:
             logger.warn("Failed to calculate available memory. Memory load limit has been disabled")
+            debug_log("load_video_memory_probe_failed", error=str(exc))
             memory_limit = BIGMAX
+    memory_limit = max(0, memory_limit)
     if vae is not None:
         #space required to load as f32, exist as latent with wiggle room, decode to f32
-        max_loadable_frames = int(memory_limit//(width*height*3*(4+4+1/10)))
+        frame_cost = estimate_frame_memory(width, height, 3, multiplier=2.25)
     else:
-        #TODO: use better estimate for when vae is not None
-        #Consider completely ignoring for load_latent case?
-        max_loadable_frames = int(memory_limit//(width*height*3*(.1)))
+        frame_cost = estimate_frame_memory(new_width, new_height, 4 if alpha else 3, multiplier=2.0)
+    max_loadable_frames = max(1, int(memory_limit // frame_cost)) if memory_limit != BIGMAX else BIGMAX
+    debug_log("load_video_memory_budget", video=kwargs['video'], memory_limit=memory_limit, frame_cost=frame_cost, max_loadable_frames=max_loadable_frames)
     if meta_batch is not None:
         if 'frames' in format:
             if meta_batch.frames_per_batch % format['frames'][0] != format['frames'][1]:
@@ -383,7 +410,7 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
         except StopIteration:
             pass
     if len(images) == 0:
-        raise RuntimeError("No frames generated")
+        raise_video_error(kwargs['video'], "No frames were generated.")
     if 'frames' in format and len(images) % format['frames'][0] != format['frames'][1]:
         err_msg = f"The number of frames loaded {len(images)}, does not match the requirements of the currently selected format."
         if len(format['frames']) > 2 and format['frames'][2]:
@@ -508,7 +535,10 @@ class LoadVideoPath:
         if kwargs['video'] is None or validate_path(kwargs['video']) != True:
             raise Exception("video is not a valid path: " + kwargs['video'])
         if is_url(kwargs['video']):
-            kwargs['video'] = try_download_video(kwargs['video']) or kwargs['video']
+            downloaded = try_download_video(kwargs['video'])
+            if downloaded is None:
+                raise_video_error(kwargs['video'], "Failed to download URL source.")
+            kwargs['video'] = downloaded
         return load_video(**kwargs)
 
     @classmethod
@@ -609,7 +639,10 @@ class LoadVideoFFmpegPath:
         if kwargs['video'] is None or validate_path(kwargs['video']) != True:
             raise Exception("video is not a valid path: " + kwargs['video'])
         if is_url(kwargs['video']):
-            kwargs['video'] = try_download_video(kwargs['video']) or kwargs['video']
+            downloaded = try_download_video(kwargs['video'])
+            if downloaded is None:
+                raise_video_error(kwargs['video'], "Failed to download URL source.")
+            kwargs['video'] = downloaded
         image, _, audio, video_info =  load_video(**kwargs, generator=ffmpeg_frame_generator)
         if isinstance(image, dict):
             return (image, None, audio, video_info)

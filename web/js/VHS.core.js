@@ -474,8 +474,125 @@ async function getAuthHeader() {
   }
 }
 
-async function uploadFile(file, progressCallback) {
+function isVHSDebugEnabled() {
+    return !!app.ui.settings.getSettingValue("VHS.Debug")
+}
+
+function debugLog(event, payload) {
+    if (!isVHSDebugEnabled()) {
+        return
+    }
+    if (payload === undefined) {
+        console.debug("[VHS]", event)
+    } else {
+        console.debug("[VHS]", event, payload)
+    }
+}
+
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+        return "0 B"
+    }
+    const units = ["B", "KB", "MB", "GB", "TB"]
+    let value = bytes
+    let unitIndex = 0
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024
+        unitIndex += 1
+    }
+    return `${roundToPrecision(value, 2)} ${units[unitIndex]}`
+}
+
+function getFileExtension(name="") {
+    const lastDot = name.lastIndexOf(".")
+    if (lastDot < 0) {
+        return ""
+    }
+    return name.slice(lastDot + 1).toLowerCase()
+}
+
+function matchesAcceptedMedia(file, acceptedTypes=[]) {
+    if (!acceptedTypes?.length) {
+        return true
+    }
+    const extension = getFileExtension(file?.name)
+    return acceptedTypes.some((accepted) => {
+        if (!accepted) {
+            return false
+        }
+        if (accepted.startsWith(".")) {
+            return extension === accepted.slice(1).toLowerCase()
+        }
+        if (accepted.endsWith("/*")) {
+            return file?.type?.startsWith?.(accepted.slice(0, -1))
+        }
+        return file?.type === accepted || extension === accepted.toLowerCase()
+    })
+}
+
+let vhsServerFeaturesPromise = null
+async function getServerFeatures() {
+    if (vhsServerFeaturesPromise) {
+        return vhsServerFeaturesPromise
+    }
+    vhsServerFeaturesPromise = (async () => {
+        try {
+            const headers = await getAuthHeader() ?? {}
+            const resp = await fetch(api.apiURL("/features"), { headers })
+            if (!resp.ok) {
+                throw new Error(`${resp.status} ${resp.statusText}`)
+            }
+            const features = await resp.json()
+            debugLog("server_features", features)
+            return features
+        } catch (error) {
+            console.warn("[VHS] Failed to fetch server features:", error)
+            return {}
+        }
+    })()
+    return vhsServerFeaturesPromise
+}
+
+async function validateUpload(file, acceptedTypes, label) {
+    if (!file) {
+        return "No file selected."
+    }
+    if (!matchesAcceptedMedia(file, acceptedTypes)) {
+        return `Unsupported ${label} file type: ${file.name}`
+    }
+    const features = await getServerFeatures()
+    const maxUploadSize = Number(features?.max_upload_size ?? 0)
+    debugLog("upload_probe", {
+        file: file.name,
+        label,
+        size: file.size,
+        maxUploadSize,
+    })
+    if (maxUploadSize > 0 && file.size > maxUploadSize) {
+        return `${label} exceeds the current ComfyUI upload limit (${formatBytes(file.size)} > ${formatBytes(maxUploadSize)}).`
+    }
+    return null
+}
+
+async function fetchWithOptionalAuth(url, options={}) {
+    const headers = {
+        ...(options.headers ?? {}),
+        ...((await getAuthHeader()) ?? {}),
+    }
+    return fetch(url, {
+        ...options,
+        headers,
+    })
+}
+
+async function uploadFile(file, progressCallback, options={}) {
     try {
+        const validationError = await validateUpload(file, options.acceptedTypes ?? [], options.label ?? "Media")
+        if (validationError) {
+            alert(validationError)
+            debugLog("upload_rejected", { file: file?.name, reason: validationError })
+            return null
+        }
         // Wrap file in formdata so it includes filename
         const body = new FormData();
         const i = file.webkitRelativePath.lastIndexOf('/');
@@ -504,10 +621,12 @@ async function uploadFile(file, progressCallback) {
 
         if (resp.status !== 200) {
             alert(resp.status + " - " + resp.statusText);
+            debugLog("upload_failed", { file: file.name, status: resp.status, statusText: resp.statusText })
         }
         return resp
     } catch (error) {
         alert(error);
+        debugLog("upload_exception", { file: file?.name, error: String(error) })
     }
 }
 
@@ -593,8 +712,10 @@ function cloneType(nodeType, nodeData) {
                     let removed_links = []
                     for (let link_id of this.outputs[0].links) {
                         let link = app.graph.links[link_id]
-                        if (!link)
-                            debugger
+                        if (!link) {
+                            console.warn("[VHS] Missing link metadata during type clone", link_id)
+                            continue
+                        }
                         let target_node = app.graph.getNodeById(link.target_id)
                         let target_input = target_node.inputs[link.target_slot]
                         let keep = LiteGraph.isValidConnection(new_type, target_input.type)
@@ -635,36 +756,11 @@ function addDateFormatting(nodeType, field, timestamp_widget = false) {
     });
 }
 function addTimestampWidget(nodeType, nodeData, targetWidget) {
-    const newWidgets = {};
-    for (let key in nodeData.input.required) {
-        if (key == targetWidget) {
-            //TODO: account for duplicate entries?
-            newWidgets["timestamp_directory"] = ["BOOLEAN", {"default": true}]
-        }
-        newWidgets[key] = nodeData.input.required[key];
-    }
-    nodeDta.input.required = newWidgets;
-    chainCallback(nodeType.prototype, "onNodeCreated", function () {
-        const directoryWidget = this.widgets.find((w) => w.name === "directory_name");
-        const timestampWidget = this.widgets.find((w) => w.name === "timestamp_directory");
-        directoryWidget.serializeValue = () => {
-            if (timestampWidget.value) {
-                //ignore actual value and return timestamp
-                return formatDate("yyyy-MM-ddThh:mm:ss", new Date());
-            }
-            return directoryWidget.value
-        };
-        timestampWidget._value = value;
-        Object.definteProperty(timestampWidget, "value", {
-            set : function(value) {
-                this._value = value;
-                directoryWidget.disabled = value;
-            },
-            get : function() {
-                return this._value;
-            }
-        });
-    });
+    // Deprecated helper intentionally retained as a no-op for compatibility.
+    console.warn("[VHS] addTimestampWidget is deprecated and disabled", {
+        nodeType: nodeType?.name,
+        targetWidget,
+    })
 }
 function initializeLoadFormat(nodeType, nodeData) {
     if (!nodeData?.input?.optional?.format) {
@@ -740,8 +836,9 @@ function initializeLoadFormat(nodeType, nodeData) {
 }
 
 function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
-    let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif"],
-                  'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg"]}
+    let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif", ".mkv", ".mov", ".gif"],
+                  'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg", "audio/flac", "audio/mp4", ".m4a", ".flac"],
+                  'folder': ["image/*", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".avif"]}
     chainCallback(nodeType.prototype, "onNodeCreated", function() {
         const node = this
         const pathWidget = this.widgets.find((w) => w.name === widgetName);
@@ -768,7 +865,8 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                     let successes = 0;
                     const onProg = (p) => this.progress = (successes + p) / fileInput.files.length
                     for(const file of fileInput.files) {
-                        if ((await uploadFile(file, onProg)).status == 200) {
+                        const response = await uploadFile(file, onProg, { acceptedTypes: accept.folder, label: "Image sequence file" })
+                        if (response?.status == 200) {
                             successes++;
                         } else {
                             this.progress = undefined
@@ -791,12 +889,15 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                 },
             });
         } else {
-            let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif"],
-                          'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg"]}[type]
+            let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif", ".mp4", ".webm", ".mkv", ".mov", ".gif"],
+                          'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg", "audio/flac", "audio/mp4", ".mp3", ".wav", ".ogg", ".m4a", ".flac"]}[type]
             async function doUpload(file) {
-                let resp = await uploadFile(file, (p) => node.progress = p)
+                let resp = await uploadFile(file, (p) => node.progress = p, {
+                    acceptedTypes: accept,
+                    label: type === "audio" ? "Audio" : "Video",
+                })
                 node.progress = undefined
-                if (resp.status != 200) {
+                if (!resp || resp.status != 200) {
                     return false
                 }
                 const filename = JSON.parse(resp.responseText).name;
@@ -824,7 +925,7 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                 }
                 //TODO: Allow dragging multiple files at once?
                 const item = e.dataTransfer?.files?.[0]
-                if (accept.includes(item?.type)) {
+                if (matchesAcceptedMedia(item, accept)) {
                     return await doUpload(item)
                 }
                 return false
@@ -903,6 +1004,7 @@ function addAudioPreview(nodeType, isInput=true) {
                 params.deadline = app.ui.settings.getSettingValue("VHS.AdvancedPreviewsDeadline")
                 element.src = api.apiURL('/vhs/viewaudio?' + new URLSearchParams(params));
             }
+            debugLog("audio_preview_source", { advp, params, src: element.src })
         }
         previewWidget.callback = previewWidget.updateSource
 
@@ -985,7 +1087,7 @@ function addVideoPreview(nodeType, isInput=true) {
             app.dragOverNode = this
         })
         previewWidget.value = {hidden: false, paused: false, params: {},
-            muted: app.ui.settings.getSettingValue("VHS.DefaultMute")}
+            muted: app.ui.settings.getSettingValue("VHS.AdvancedPreviewsDefaultMute"), error: ""}
         previewWidget.parentEl = document.createElement("div");
         previewWidget.parentEl.className = "vhs_preview";
         previewWidget.parentEl.style['width'] = "100%"
@@ -1001,7 +1103,7 @@ function addVideoPreview(nodeType, isInput=true) {
             fitHeight(this);
         });
         previewWidget.videoEl.addEventListener("error", () => {
-            //TODO: consider a way to properly notify the user why a preview isn't shown.
+            previewWidget.setStatus("Preview unavailable. Check VHS debug logs for details.")
             previewWidget.parentEl.hidden = true;
             fitHeight(this);
         });
@@ -1017,10 +1119,23 @@ function addVideoPreview(nodeType, isInput=true) {
         previewWidget.imgEl.hidden = true;
         previewWidget.imgEl.onload = () => {
             previewWidget.aspectRatio = previewWidget.imgEl.naturalWidth / previewWidget.imgEl.naturalHeight;
+            previewWidget.setStatus("")
             fitHeight(this);
         };
+        previewWidget.statusEl = document.createElement("div");
+        previewWidget.statusEl.className = "vhs_preview_status";
+        previewWidget.statusEl.style.fontSize = "12px";
+        previewWidget.statusEl.style.padding = "4px 0";
+        previewWidget.statusEl.style.color = "#ccc";
+        previewWidget.statusEl.hidden = true;
+        previewWidget.setStatus = function(message) {
+            this.value.error = message || ""
+            this.statusEl.hidden = !message
+            this.statusEl.textContent = message || ""
+        }
         previewWidget.parentEl.appendChild(previewWidget.videoEl)
         previewWidget.parentEl.appendChild(previewWidget.imgEl)
+        previewWidget.parentEl.appendChild(previewWidget.statusEl)
         var timeout = null;
         this.updateParameters = (params, force_update) => {
             if (!previewWidget.value.params) {
@@ -1062,6 +1177,9 @@ function addVideoPreview(nodeType, isInput=true) {
             Object.assign(params, this.value.params);//shallow copy
             params.timestamp = Date.now()
             this.parentEl.hidden = this.value.hidden;
+            this.setStatus("")
+            this.videoEl.src = ""
+            this.imgEl.src = ""
             if (params.format?.split('/')[0] == 'video'
                 || advp && (params.format?.split('/')[1] == 'gif')
                 || params.format == 'folder') {
@@ -1084,13 +1202,19 @@ function addVideoPreview(nodeType, isInput=true) {
                     params.deadline = app.ui.settings.getSettingValue("VHS.AdvancedPreviewsDeadline")
                     this.videoEl.src = api.apiURL('/vhs/viewvideo?' + new URLSearchParams(params));
                 }
+                debugLog("video_preview_source", { advp, params, src: this.videoEl.src })
                 this.videoEl.hidden = false;
                 this.imgEl.hidden = true;
             } else if (params.format?.split('/')[0] == 'image'){
                 //Is animated image
                 this.imgEl.src = api.apiURL('/view?' + new URLSearchParams(params));
+                debugLog("image_preview_source", { params, src: this.imgEl.src })
                 this.videoEl.hidden = true;
                 this.imgEl.hidden = false;
+            } else {
+                this.parentEl.hidden = true;
+                this.setStatus("Preview format is not supported for this node state.")
+                debugLog("preview_unsupported_format", { params })
             }
             delete previewNode.video_query
             const doQuery = async () => {
@@ -1099,19 +1223,26 @@ function addVideoPreview(nodeType, isInput=true) {
                 }
                 let qurl = api.apiURL('/vhs/queryvideo?' + new URLSearchParams(previewWidget.value.params))
                 let query = undefined
+                let query_res = undefined
                 try {
-                    let query_res = await fetch(qurl)
+                    query_res = await fetchWithOptionalAuth(qurl)
                     query = await query_res.json()
                 } catch(e) {
+                    previewWidget.setStatus("Preview metadata lookup failed.")
+                    debugLog("video_query_failed", { url: qurl, error: String(e) })
+                    return
+                }
+                if (!query_res.ok || query?.error) {
+                    previewWidget.setStatus(query?.error || "Preview metadata unavailable.")
+                    debugLog("video_query_error", { url: qurl, query })
                     return
                 }
                 previewNode.video_query = query
+                debugLog("video_query", { url: qurl, query })
             }
             doQuery()
         }
         previewWidget.callback = previewWidget.updateSource
-        previewWidget.parentEl.appendChild(previewWidget.videoEl)
-        previewWidget.parentEl.appendChild(previewWidget.imgEl)
     });
 }
 let copiedPath = undefined
@@ -1498,13 +1629,14 @@ function searchBox(event, [x,y], node) {
             }
             let optionsURL = api.apiURL('/vhs/getpath?' + new URLSearchParams(params));
             try {
-                let resp = await fetch(optionsURL);
+                let resp = await fetchWithOptionalAuth(optionsURL);
                 options = await resp.json();
                 options = options.map((o) => o.replace('.','\0'))
                 options = options.sort()
                 options = options.map((o) => o.replace('\0','.'))
             } catch(e) {
                 options = []
+                debugLog("path_lookup_failed", { url: optionsURL, error: String(e) })
             }
             last_path = path;
         }
@@ -1839,6 +1971,14 @@ app.registerExtension({
         id: 'VHS.AdvancedPreviewsDefaultMute',
         category: ['🎥🅥🅗🅢', 'Previews', 'Default Mute'],
         name: 'Mute videos by default',
+        type: 'boolean',
+        defaultValue: false,
+      },
+      {
+        id: 'VHS.Debug',
+        category: ['🎥🅥🅗🅢', 'Debug'],
+        name: 'Enable VHS debug logs',
+        tooltip: 'Log upload, preview, and query diagnostics to the browser console.',
         type: 'boolean',
         defaultValue: false,
       },

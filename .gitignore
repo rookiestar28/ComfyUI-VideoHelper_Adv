@@ -160,3 +160,7 @@ cython_debug/
 #.idea/
 # VIM swap files
 *.swp
+
+# Local planning / roadmap references
+.planning/
+ROADMAP.md

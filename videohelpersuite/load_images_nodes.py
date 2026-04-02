@@ -9,7 +9,7 @@ import folder_paths
 from comfy.k_diffusion.utils import FolderOfImages
 from comfy.utils import common_upscale, ProgressBar
 from .logger import logger
-from .utils import BIGMAX, calculate_file_hash, get_sorted_dir_files_from_directory, validate_path, strip_path
+from .utils import BIGMAX, calculate_file_hash, get_sorted_dir_files_from_directory, validate_path, strip_path, is_safe_path
 
 
 def is_changed_load_images(directory: str, image_load_cap: int = 0, skip_first_images: int = 0, select_every_nth: int = 1, **kwargs):
@@ -27,6 +27,11 @@ def is_changed_load_images(directory: str, image_load_cap: int = 0, skip_first_i
 
 
 def validate_load_images(directory: str):
+    directory = strip_path(directory)
+    if not directory:
+        return "Directory path is empty."
+    if not is_safe_path(directory):
+        return f"Directory '{directory}' is outside the allowed path scope."
     if not os.path.isdir(directory):
             return f"Directory '{directory}' cannot be found."
     dir_files = os.listdir(directory)
@@ -36,8 +41,9 @@ def validate_load_images(directory: str):
     return True
 
 def images_generator(directory: str, image_load_cap: int = 0, skip_first_images: int = 0, select_every_nth: int = 1, meta_batch=None, unique_id=None):
+    directory = strip_path(directory)
     if not os.path.isdir(directory):
-        raise FileNotFoundError(f"Directory '{directory} cannot be found.")
+        raise FileNotFoundError(f"Directory '{directory}' cannot be found.")
     dir_files = get_sorted_dir_files_from_directory(directory, skip_first_images, select_every_nth, FolderOfImages.IMG_EXTENSIONS)
 
     if len(dir_files) == 0:
