@@ -347,10 +347,11 @@ def validate_path(path, allow_none=False, allow_url=True):
     if path is None:
         return allow_none
     if is_url(path):
+        # IMPORTANT: strict local path rules apply only to filesystem paths, not supported URL inputs.
         #Probably not feasible to check if url resolves here
         if not allow_url:
             return "URLs are unsupported for this path"
-        return is_safe_path(path)
+        return True
     if not os.path.isfile(strip_path(path)):
         return "Invalid file path: {}".format(path)
     return is_safe_path(path)

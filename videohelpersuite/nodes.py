@@ -800,7 +800,7 @@ class PruneOutputs:
         return {
                 "required": {
                     "filenames": ("VHS_FILENAMES",),
-                    "options": (["Intermediate", "Intermediate and Utility"],)
+                    "options": (["Intermediate", "Intermediate and Utility", "All"],)
                     }
                 }
 

@@ -164,3 +164,6 @@ cython_debug/
 # Local planning / roadmap references
 .planning/
 ROADMAP.md
+tests/TEST_SOP.md
+tests/E2E_TESTING_NOTICE.md
+tests/E2E_TESTING_SOP.md

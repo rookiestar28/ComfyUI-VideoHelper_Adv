@@ -1857,7 +1857,7 @@ function mouseAnnotated(event, [x, y], node) {
     let isButton = 0
     if (x > margin + 6 && x < margin + 16) {
         isButton = -1
-    } else if (x > widget_width - margin - 16 & x < widget_width - margin - 6) {
+    } else if (x > widget_width - margin - 16 && x < widget_width - margin - 6) {
         isButton = 1
     } else if (x > widget_width - margin - 34 && x < widget_width - margin - 18) {
         isButton = 2
@@ -2368,7 +2368,7 @@ app.registerExtension({
                         if (this.options.max && v > this.options.max) {
                             v = this.options.max
                         }
-                        if (this.options.min && v < this.options.max) {
+                        if (this.options.min != null && v < this.options.min) {
                             v = this.options.min
                         }
                         this.value = v
