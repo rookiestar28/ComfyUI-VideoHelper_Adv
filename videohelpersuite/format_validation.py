@@ -3,6 +3,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 
 
 ALLOWED_TOP_LEVEL_KEYS = {
@@ -52,6 +53,16 @@ class FormatValidationResult:
     errors: list[str]
     warnings: list[str]
     env_warnings: list[str]
+
+
+def _flatten_list(values):
+    flattened = []
+    for value in values:
+        if isinstance(value, list):
+            flattened.extend(value)
+        else:
+            flattened.append(value)
+    return flattened
 
 
 def _parse_encoder_names(text: str) -> set[str]:
@@ -212,3 +223,60 @@ def validate_format_directory(path: str | Path, capabilities: CapabilityReport |
         validate_format_file(item, capabilities=capabilities)
         for item in sorted(path.glob("*.json"))
     ]
+
+
+def _iterate_format(video_format, for_widgets=True):
+    def indirector(container, index):
+        if isinstance(container[index], list) and (
+            not for_widgets or len(container[index]) > 1 and not isinstance(container[index][1], dict)
+        ):
+            incoming = yield container[index]
+            if incoming is not None:
+                container[index] = incoming
+                yield
+
+    for key in video_format:
+        if key == "extra_widgets":
+            if for_widgets:
+                yield from video_format["extra_widgets"]
+        elif key.endswith("_pass"):
+            for index in range(len(video_format[key])):
+                yield from indirector(video_format[key], index)
+            if not for_widgets:
+                video_format[key] = _flatten_list(video_format[key])
+        else:
+            yield from indirector(video_format, key)
+
+
+def materialize_format_data(data: dict, overrides: dict | None = None) -> dict:
+    overrides = dict(overrides or {})
+    materialized = json.loads(json.dumps(data))
+    for widget in _iterate_format(materialized):
+        if widget[0] not in overrides:
+            if len(widget) > 2 and isinstance(widget[2], dict) and "default" in widget[2]:
+                default = widget[2]["default"]
+            elif isinstance(widget[1], list) and widget[1]:
+                default = widget[1][0]
+            else:
+                default = {"BOOLEAN": False, "INT": 0, "FLOAT": 0, "STRING": ""}.get(widget[1], "")
+            overrides[widget[0]] = default
+
+    iterator = _iterate_format(materialized, for_widgets=False)
+    for widget in iterator:
+        value = widget
+        while isinstance(value, list):
+            if len(value) == 1:
+                value = [Template(item).substitute(**overrides) for item in value[0]]
+                break
+            if isinstance(value[1], dict):
+                value = value[1][str(overrides[value[0]])]
+            elif len(value) > 3:
+                value = Template(value[3]).substitute(val=overrides[value[0]])
+            else:
+                value = str(overrides[value[0]])
+        iterator.send(value)
+    return materialized
+
+
+def materialize_format_file(path: str | Path, overrides: dict | None = None) -> dict:
+    return materialize_format_data(_load_json(Path(path)), overrides=overrides)
