@@ -1098,11 +1098,15 @@ function addVideoPreview(nodeType, isInput=true) {
         previewWidget.videoEl.muted = true;
         previewWidget.videoEl.style['width'] = "100%"
         previewWidget.videoEl.addEventListener("loadedmetadata", () => {
-
+            previewWidget.parentEl.hidden = previewWidget.value.hidden;
+            previewWidget.setStatus("")
             previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
             fitHeight(this);
         });
         previewWidget.videoEl.addEventListener("error", () => {
+            if (!previewWidget.videoEl.currentSrc && !previewWidget.videoEl.src) {
+                return
+            }
             previewWidget.setStatus("Preview unavailable. Check VHS debug logs for details.")
             previewWidget.parentEl.hidden = true;
             fitHeight(this);
@@ -1118,6 +1122,7 @@ function addVideoPreview(nodeType, isInput=true) {
         previewWidget.imgEl.style['width'] = "100%"
         previewWidget.imgEl.hidden = true;
         previewWidget.imgEl.onload = () => {
+            previewWidget.parentEl.hidden = previewWidget.value.hidden;
             previewWidget.aspectRatio = previewWidget.imgEl.naturalWidth / previewWidget.imgEl.naturalHeight;
             previewWidget.setStatus("")
             fitHeight(this);
@@ -1178,8 +1183,6 @@ function addVideoPreview(nodeType, isInput=true) {
             params.timestamp = Date.now()
             this.parentEl.hidden = this.value.hidden;
             this.setStatus("")
-            this.videoEl.src = ""
-            this.imgEl.src = ""
             if (params.format?.split('/')[0] == 'video'
                 || advp && (params.format?.split('/')[1] == 'gif')
                 || params.format == 'folder') {
