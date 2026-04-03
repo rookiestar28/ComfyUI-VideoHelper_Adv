@@ -585,6 +585,123 @@ async function fetchWithOptionalAuth(url, options={}) {
     })
 }
 
+function joinUploadPath(subfolder="", name="") {
+    if (!subfolder) {
+        return name
+    }
+    const normalized = subfolder.endsWith("/") ? subfolder.slice(0, -1) : subfolder
+    return normalized ? `${normalized}/${name}` : name
+}
+
+function getRelativeUploadSubfolder(file, options={}) {
+    const relativePath = file?.webkitRelativePath ?? ""
+    const lastSlash = relativePath.lastIndexOf("/")
+    if (lastSlash > 0) {
+        return relativePath.slice(0, lastSlash + 1)
+    }
+    return options.subfolder ?? ""
+}
+
+function getAssetTagPathParts(subfolder="") {
+    return subfolder
+        .split(/[\\/]/)
+        .map((part) => part.trim())
+        .filter(Boolean)
+}
+
+function normalizeLegacyUploadPath(payload={}) {
+    if (!payload?.name) {
+        return null
+    }
+    return joinUploadPath(payload.subfolder ?? "", payload.name)
+}
+
+function normalizeAssetUploadPath(payload={}) {
+    const filename = payload?.user_metadata?.filename
+    return typeof filename === "string" && filename.length > 0 ? filename : null
+}
+
+async function sendMultipartUpload(url, body, progressCallback) {
+    return await new Promise((resolve, reject) => {
+        const req = new XMLHttpRequest()
+        req.upload.onprogress = (event) => {
+            if (event.lengthComputable && event.total > 0) {
+                progressCallback?.(event.loaded / event.total)
+            }
+        }
+        req.onerror = () => reject(new Error(`Upload request failed: ${url}`))
+        req.onload = () => {
+            let json = null
+            try {
+                json = req.responseText ? JSON.parse(req.responseText) : null
+            } catch (error) {
+                debugLog("upload_response_parse_failed", {
+                    url,
+                    status: req.status,
+                    error: String(error),
+                })
+            }
+            resolve({
+                ok: req.status >= 200 && req.status < 300,
+                status: req.status,
+                statusText: req.statusText,
+                responseText: req.responseText,
+                json,
+                url,
+            })
+        }
+        req.open("post", url, true)
+        getAuthHeader()
+            .then((headers) => {
+                headers ??= {}
+                for (const key in headers) {
+                    req.setRequestHeader(key, headers[key])
+                }
+                req.send(body)
+            })
+            .catch(reject)
+    })
+}
+
+async function uploadViaLegacyPath(file, progressCallback, options={}) {
+    const body = new FormData()
+    const subfolder = getRelativeUploadSubfolder(file, options)
+    const materializedFile = new File([file], file.name, {
+        type: file.type,
+        lastModified: file.lastModified,
+    })
+    body.append("image", materializedFile)
+    if (subfolder) {
+        body.append("subfolder", subfolder)
+    }
+    const response = await sendMultipartUpload(api.apiURL("/upload/image"), body, progressCallback)
+    response.path = normalizeLegacyUploadPath(response.json)
+    response.route = "legacy"
+    return response
+}
+
+async function uploadViaAssetRoute(file, progressCallback, options={}) {
+    const body = new FormData()
+    const subfolder = getRelativeUploadSubfolder(file, options)
+    const materializedFile = new File([file], file.name, {
+        type: file.type,
+        lastModified: file.lastModified,
+    })
+    body.append("file", materializedFile)
+    body.append("tags", options.assetRootTag ?? "input")
+    for (const tag of getAssetTagPathParts(subfolder)) {
+        body.append("tags", tag)
+    }
+    body.append("name", file.name)
+    if (file.type) {
+        body.append("mime_type", file.type)
+    }
+    const response = await sendMultipartUpload(api.apiURL("/api/assets"), body, progressCallback)
+    response.path = normalizeAssetUploadPath(response.json)
+    response.route = "asset"
+    return response
+}
+
 async function uploadFile(file, progressCallback, options={}) {
     try {
         const validationError = await validateUpload(file, options.acceptedTypes ?? [], options.label ?? "Media")
@@ -593,37 +710,40 @@ async function uploadFile(file, progressCallback, options={}) {
             debugLog("upload_rejected", { file: file?.name, reason: validationError })
             return null
         }
-        // Wrap file in formdata so it includes filename
-        const body = new FormData();
-        const i = file.webkitRelativePath.lastIndexOf('/');
-        const subfolder = file.webkitRelativePath.slice(0,i+1)
-        const new_file = new File([file], file.name, {
-            type: file.type,
-            lastModified: file.lastModified,
-        });
-        body.append("image", new_file);
-        if (i > 0) {
-            body.append("subfolder", subfolder);
-        }
-        const url = api.apiURL("/upload/image")
-        const resp = await new Promise((resolve) => {
-            let req = new XMLHttpRequest()
-            req.upload.onprogress = (e) => progressCallback?.(e.loaded/e.total)
-            req.onload = () => resolve(req)
-            req.open('post', url, true)
-            getAuthHeader().then((headers) => {
-                headers ??= {}
-                for (const key in headers)
-                    req.setRequestHeader(key, headers[key])
-                req.send(body)
-            })
-        })
+        const features = await getServerFeatures()
+        const shouldTryAssetUpload = features?.assets === true
 
-        if (resp.status !== 200) {
-            alert(resp.status + " - " + resp.statusText);
-            debugLog("upload_failed", { file: file.name, status: resp.status, statusText: resp.statusText })
+        if (shouldTryAssetUpload) {
+            debugLog("upload_strategy", {
+                file: file.name,
+                strategy: "asset-first",
+            })
+            const assetResponse = await uploadViaAssetRoute(file, progressCallback, options)
+            if (assetResponse.ok && assetResponse.path) {
+                return assetResponse
+            }
+            // IMPORTANT: asset uploads can dedupe content without creating a path on disk.
+            // Keep the legacy materialized upload fallback for VHS path-based widgets.
+            debugLog("upload_asset_fallback", {
+                file: file.name,
+                status: assetResponse.status,
+                statusText: assetResponse.statusText,
+                path: assetResponse.path,
+                payload: assetResponse.json,
+            })
         }
-        return resp
+
+        const legacyResponse = await uploadViaLegacyPath(file, progressCallback, options)
+        if (!legacyResponse.ok || !legacyResponse.path) {
+            alert(legacyResponse.status + " - " + legacyResponse.statusText);
+            debugLog("upload_failed", {
+                file: file.name,
+                status: legacyResponse.status,
+                statusText: legacyResponse.statusText,
+                payload: legacyResponse.json,
+            })
+        }
+        return legacyResponse
     } catch (error) {
         alert(error);
         debugLog("upload_exception", { file: file?.name, error: String(error) })
@@ -866,7 +986,7 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                     const onProg = (p) => this.progress = (successes + p) / fileInput.files.length
                     for(const file of fileInput.files) {
                         const response = await uploadFile(file, onProg, { acceptedTypes: accept.folder, label: "Image sequence file" })
-                        if (response?.status == 200) {
+                        if (response?.ok) {
                             successes++;
                         } else {
                             this.progress = undefined
@@ -897,10 +1017,10 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                     label: type === "audio" ? "Audio" : "Video",
                 })
                 node.progress = undefined
-                if (!resp || resp.status != 200) {
+                if (!resp?.ok || !resp.path) {
                     return false
                 }
-                const filename = JSON.parse(resp.responseText).name;
+                const filename = resp.path
                 pathWidget.options.values.push(filename);
                 pathWidget.value = filename;
                 if (pathWidget.callback) {
@@ -2537,11 +2657,11 @@ app.registerExtension({
                 //TODO: upload to pasted dir?
                 const blob = video.getAsFile()
                 const resp = await uploadFile(blob)
-                if (resp.status != 200) {
+                if (!resp?.ok || !resp.path) {
                     //upload failed and file can not be added to options
                     return;
                 }
-                const filename = (await resp.json()).name;
+                const filename = resp.path;
                 pathWidget.options.values.push(filename);
                 pathWidget.value = filename;
                 pathWidget.callback?.(filename)
