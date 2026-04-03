@@ -3,6 +3,7 @@ import folder_paths
 import os
 import subprocess
 import re
+from contextlib import suppress
 
 import asyncio
 try:
@@ -45,6 +46,90 @@ def parse_float(query, key, default=0.0, minimum=None):
         value = max(minimum, value)
     return value
 
+
+def decode_process_output(payload):
+    if not payload:
+        return ""
+    return payload.decode(*ENCODE_ARGS)
+
+
+async def cleanup_preview_process(proc, *, kill=False, label="preview"):
+    if proc is None:
+        return
+
+    if kill and proc.returncode is None:
+        with suppress(ProcessLookupError, OSError):
+            proc.kill()
+
+    with suppress(Exception):
+        await proc.wait()
+
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        # CRITICAL: explicitly close asyncio subprocess transports on Windows.
+        # Relying on GC leaks Proactor pipe transports and emits closed-pipe warnings.
+        with suppress(Exception):
+            transport.close()
+
+    debug_log("preview_process_cleanup", label=label, kill=kill, returncode=proc.returncode)
+
+
+async def run_preview_prepass(*args):
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+        stdout, stderr = await proc.communicate()
+        return proc.returncode, stdout, stderr
+    finally:
+        await cleanup_preview_process(proc, label="preview_prepass")
+
+
+async def stream_preview_response(request, *, args, filename, content_type, debug_event):
+    proc = None
+    response = web.StreamResponse()
+    response.content_type = content_type
+    response.headers["Content-Disposition"] = f"filename=\"{filename}\""
+    prepared = False
+    disconnected = False
+
+    try:
+        debug_log(debug_event, filename=filename, args=args)
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+        await response.prepare(request)
+        prepared = True
+        while True:
+            chunk = await proc.stdout.read(2**20)
+            if not chunk:
+                break
+            await response.write(chunk)
+    except (ConnectionResetError, ConnectionError, asyncio.CancelledError) as exc:
+        disconnected = True
+        debug_log("preview_stream_disconnected", filename=filename, error=str(exc))
+    except Exception as exc:
+        debug_log("preview_stream_failed", filename=filename, error=str(exc))
+        if not prepared:
+            return error_response(500, f"Failed to generate preview for: {filename}")
+    finally:
+        await cleanup_preview_process(
+            proc,
+            kill=disconnected,
+            label=filename,
+        )
+        if prepared and not disconnected:
+            with suppress(Exception):
+                await response.write_eof()
+
+    return response
+
 @server.PromptServer.instance.routes.get("/vhs/viewvideo")
 @server.PromptServer.instance.routes.get("/viewvideo")
 async def view_video(request):
@@ -82,22 +167,26 @@ async def view_video(request):
     #Do prepass to pull info
     #breaks skip_first frames if this default is ever actually needed
     base_fps = 30
-    try:
-        proc = await asyncio.create_subprocess_exec(ffmpeg_path, *in_args, '-t',
-                                   '0','-f', 'null','-', stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
-        _, res_stderr = await proc.communicate()
+    returncode, _, res_stderr = await run_preview_prepass(
+        ffmpeg_path,
+        *in_args,
+        '-t',
+        '0',
+        '-f',
+        'null',
+        '-',
+    )
+    if returncode not in (0, None):
+        message = decode_process_output(res_stderr)
+        debug_log("view_video_prepass_failed", filename=filename, returncode=returncode, stderr=message)
+        return error_response(500, f"Failed to inspect media for preview: {filename}")
 
-        match = re.search(': Video: (\\w+) .+, (\\d+) fps,', res_stderr.decode(*ENCODE_ARGS))
-        if match:
-            base_fps = float(match.group(2))
-            if match.group(1) == 'vp9':
-                #force libvpx for transparency
-                in_args = ['-c:v', 'libvpx-vp9'] + in_args
-    except subprocess.CalledProcessError as e:
-        print("An error occurred in the ffmpeg prepass:\n" \
-                + e.stderr.decode(*ENCODE_ARGS))
-        return web.Response(status=500)
+    match = re.search(': Video: (\\w+) .+, (\\d+) fps,', decode_process_output(res_stderr))
+    if match:
+        base_fps = float(match.group(2))
+        if match.group(1) == 'vp9':
+            #force libvpx for transparency
+            in_args = ['-c:v', 'libvpx-vp9'] + in_args
     vfilters = []
     target_rate = parse_float(query, 'force_rate', 0.0, 0.0) or base_fps
     modified_rate = target_rate / parse_int(query, 'select_every_nth', 1, 1)
@@ -146,25 +235,14 @@ async def view_video(request):
         deadline = 'realtime'
 
     args += ['-c:v', 'libvpx-vp9','-deadline', deadline, '-cpu-used', '8', '-f', 'webm', '-']
+    return await stream_preview_response(
+        request,
+        args=args,
+        filename=filename,
+        content_type='video/webm',
+        debug_event="view_video_preview",
+    )
 
-    try:
-        debug_log("view_video_preview", filename=filename, args=args)
-        proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE,
-                                                    stdin=subprocess.DEVNULL)
-        try:
-            resp = web.StreamResponse()
-            resp.content_type = 'video/webm'
-            resp.headers["Content-Disposition"] = f"filename=\"{filename}\""
-            await resp.prepare(request)
-            while len(bytes_read := await proc.stdout.read(2**20)) != 0:
-                await resp.write(bytes_read)
-            #Of dubious value given frequency of kill calls, but more correct
-            await proc.wait()
-        except (ConnectionResetError, ConnectionError) as e:
-            proc.kill()
-    except BrokenPipeError as e:
-        pass
-    return resp
 @server.PromptServer.instance.routes.get("/vhs/viewaudio")
 async def view_audio(request):
     query = request.rel_url.query
@@ -192,24 +270,13 @@ async def view_audio(request):
         deadline = 'realtime'
 
     args += ['-c:a', 'libopus','-deadline', deadline, '-cpu-used', '8', '-f', 'webm', '-']
-    try:
-        debug_log("view_audio_preview", filename=filename, args=args)
-        proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE,
-                                                    stdin=subprocess.DEVNULL)
-        try:
-            resp = web.StreamResponse()
-            resp.content_type = 'audio/webm'
-            resp.headers["Content-Disposition"] = f"filename=\"{filename}\""
-            await resp.prepare(request)
-            while len(bytes_read := await proc.stdout.read(2**20)) != 0:
-                await resp.write(bytes_read)
-            #Of dubious value given frequency of kill calls, but more correct
-            await proc.wait()
-        except (ConnectionResetError, ConnectionError) as e:
-            proc.kill()
-    except BrokenPipeError as e:
-        pass
-    return resp
+    return await stream_preview_response(
+        request,
+        args=args,
+        filename=filename,
+        content_type='audio/webm',
+        debug_event="view_audio_preview",
+    )
 
 query_cache = {}
 @server.PromptServer.instance.routes.get("/vhs/queryvideo")

@@ -50,6 +50,66 @@ class ServerReliabilityTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.data, ["clip.mp4", "audio.wav"])
 
+    def test_cleanup_preview_process_closes_transport_after_kill(self):
+        class DummyTransport:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummyProcess:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self.waited = False
+                self._transport = DummyTransport()
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                self.waited = True
+                return self.returncode
+
+        proc = DummyProcess()
+        self._run(self.server_mod.cleanup_preview_process(proc, kill=True, label="unit-test"))
+        self.assertTrue(proc.killed)
+        self.assertTrue(proc.waited)
+        self.assertTrue(proc._transport.closed)
+
+    def test_view_video_returns_500_when_prepass_fails(self):
+        sample_file = self.paths["output_dir"] / "clip.mp4"
+        sample_file.write_bytes(b"x")
+
+        class DummyProcess:
+            def __init__(self):
+                self.returncode = 1
+                self._transport = types.SimpleNamespace(close=lambda: None)
+
+            async def communicate(self):
+                return b"", b"ffmpeg failed"
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_create_subprocess_exec(*_args, **_kwargs):
+            return DummyProcess()
+
+        self.server_mod.ffmpeg_path = "ffmpeg"
+        self.server_mod.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        request = types.SimpleNamespace(
+            rel_url=types.SimpleNamespace(query={
+                "filename": "clip.mp4",
+                "type": "output",
+            })
+        )
+
+        response = self._run(self.server_mod.view_video(request))
+        self.assertEqual(response.status, 500)
+        self.assertIn("Failed to inspect media for preview", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()
