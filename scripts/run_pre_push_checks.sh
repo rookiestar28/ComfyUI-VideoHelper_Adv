@@ -14,6 +14,51 @@ fail() {
   exit 1
 }
 
+is_windows_shell() {
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_windowsapps_alias() {
+  candidate=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$candidate" in
+    */appdata/local/microsoft/windowsapps/python|*/appdata/local/microsoft/windowsapps/python.exe|*/appdata/local/microsoft/windowsapps/python3|*/appdata/local/microsoft/windowsapps/python3.exe)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+PYTHON_MODE="direct"
+PYTHON_BIN=""
+
+set_python_direct() {
+  candidate=$1
+  [ -n "$candidate" ] || return 1
+  if is_windowsapps_alias "$candidate"; then
+    log "Skipping unusable WindowsApps Python alias: $candidate"
+    return 1
+  fi
+  PYTHON_MODE="direct"
+  PYTHON_BIN="$candidate"
+  return 0
+}
+
+set_python_launcher() {
+  candidate=$1
+  [ -n "$candidate" ] || return 1
+  if ! "$candidate" -3 -c "import sys; print(sys.executable)" >/dev/null 2>&1; then
+    return 1
+  fi
+  PYTHON_MODE="py-launcher"
+  PYTHON_BIN="$candidate"
+  return 0
+}
+
 detect_python() {
   for candidate in \
     "$REPO_ROOT/.venv-wsl/bin/python" \
@@ -21,19 +66,28 @@ detect_python() {
     "$REPO_ROOT/.venv/Scripts/python.exe"
   do
     if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
+      set_python_direct "$candidate" && return 0
     fi
   done
 
+  if is_windows_shell; then
+    if command -v py >/dev/null 2>&1; then
+      set_python_launcher "$(command -v py)" && return 0
+    fi
+    for launcher in /c/Windows/py.exe /c/WINDOWS/py.exe; do
+      if [ -x "$launcher" ]; then
+        set_python_launcher "$launcher" && return 0
+      fi
+    done
+  fi
+
   if command -v python3 >/dev/null 2>&1; then
-    command -v python3
-    return 0
+    set_python_direct "$(command -v python3)" && return 0
   fi
   if command -v python >/dev/null 2>&1; then
-    command -v python
-    return 0
+    set_python_direct "$(command -v python)" && return 0
   fi
+
   return 1
 }
 
@@ -83,8 +137,19 @@ ensure_node_18() {
 }
 
 run_python() {
-  log "Running: $PYTHON $*"
-  "$PYTHON" "$@"
+  case "$PYTHON_MODE" in
+    direct)
+      log "Running: $PYTHON_BIN $*"
+      "$PYTHON_BIN" "$@"
+      ;;
+    py-launcher)
+      log "Running: $PYTHON_BIN -3 $*"
+      "$PYTHON_BIN" -3 "$@"
+      ;;
+    *)
+      fail "Unknown Python execution mode: $PYTHON_MODE"
+      ;;
+  esac
 }
 
 run_shell() {
@@ -92,13 +157,20 @@ run_shell() {
   "$@"
 }
 
-PYTHON=$(detect_python) || fail "No Python interpreter found. Create .venv-wsl/.venv or install python3."
-log "Using Python: $PYTHON"
+detect_python || fail "No usable Python interpreter found. Create .venv-wsl/.venv or install Python and ensure it is not only the WindowsApps alias."
+case "$PYTHON_MODE" in
+  direct)
+    log "Using Python: $PYTHON_BIN"
+    ;;
+  py-launcher)
+    log "Using Python launcher: $PYTHON_BIN -3"
+    ;;
+esac
 
 if [ -f "$REPO_ROOT/.pre-commit-config.yaml" ]; then
   export PRE_COMMIT_HOME="$REPO_ROOT/.tmp/pre-commit"
   mkdir -p "$PRE_COMMIT_HOME"
-  if "$PYTHON" -m pre_commit --version >/dev/null 2>&1; then
+  if run_python -m pre_commit --version >/dev/null 2>&1; then
     run_python -m pre_commit run detect-secrets --all-files
     run_python -m pre_commit run --all-files --show-diff-on-failure
   else
