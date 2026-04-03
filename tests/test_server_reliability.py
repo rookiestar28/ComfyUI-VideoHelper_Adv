@@ -40,8 +40,12 @@ class ServerReliabilityTests(unittest.TestCase):
     def test_get_path_respects_comma_separated_extensions(self):
         sample_dir = self.paths["output_dir"] / "browse"
         sample_dir.mkdir(parents=True, exist_ok=True)
-        (sample_dir / "clip.mp4").write_bytes(b"x")
-        (sample_dir / "audio.wav").write_bytes(b"y")
+        clip_path = sample_dir / "clip.mp4"
+        audio_path = sample_dir / "audio.wav"
+        clip_path.write_bytes(b"x")
+        audio_path.write_bytes(b"y")
+        os.utime(clip_path, (1_700_000_000, 1_700_000_000))
+        os.utime(audio_path, (1_700_000_100, 1_700_000_100))
         request = types.SimpleNamespace(rel_url=types.SimpleNamespace(query={
             "path": str(sample_dir) + "/",
             "extensions": "mp4,wav",
