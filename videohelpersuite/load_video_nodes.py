@@ -285,7 +285,8 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
                     continue
                 if len(bytes_read) == 0:#EOF
                     break
-                current_bytes[current_offset:len(bytes_read)] = bytes_read
+                # IMPORTANT: partial pipe reads must append at the current offset or frame assembly corrupts.
+                current_bytes[current_offset:current_offset + len(bytes_read)] = bytes_read
                 current_offset+=len(bytes_read)
                 if current_offset == bpi:
                     if prev_frame is not None:
