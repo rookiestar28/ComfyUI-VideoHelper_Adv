@@ -2,6 +2,7 @@ import { app } from '../../../scripts/app.js'
 import { api } from '../../../scripts/api.js'
 import { setWidgetConfig } from '../../../extensions/core/widgetInputs.js'
 import { applyTextReplacements } from "../../../scripts/utils.js";
+import { shouldUseAdvancedPreview } from "./previewRouting.js";
 
 function chainCallback(object, property, callback) {
     if (object == undefined) {
@@ -1108,15 +1109,12 @@ function addAudioPreview(nodeType, isInput=true) {
                 return;
             }
             let params =  {}
-            let advp = app.ui.settings.getSettingValue("VHS.AdvancedPreviews")
-            if (advp == 'Never') {
-                advp = false
-            } else if (advp == 'Input Only') {
-                advp = isInput
-            } else {
-                advp = true
-            }
             Object.assign(params, this.value.params);//shallow copy
+            let advp = shouldUseAdvancedPreview({
+                advancedPreviews: app.ui.settings.getSettingValue("VHS.AdvancedPreviews"),
+                isInput,
+                format: params.format,
+            })
             params.timestamp = Date.now()
             if (!advp) {
                 element.src = api.apiURL('/view?' + new URLSearchParams(params));
@@ -1291,15 +1289,12 @@ function addVideoPreview(nodeType, isInput=true) {
                 return;
             }
             let params =  {}
-            let advp = app.ui.settings.getSettingValue("VHS.AdvancedPreviews")
-            if (advp == 'Never') {
-                advp = false
-            } else if (advp == 'Input Only') {
-                advp = isInput
-            } else {
-                advp = true
-            }
             Object.assign(params, this.value.params);//shallow copy
+            let advp = shouldUseAdvancedPreview({
+                advancedPreviews: app.ui.settings.getSettingValue("VHS.AdvancedPreviews"),
+                isInput,
+                format: params.format,
+            })
             params.timestamp = Date.now()
             this.parentEl.hidden = this.value.hidden;
             this.setStatus("")

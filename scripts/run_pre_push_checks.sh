@@ -190,6 +190,12 @@ for js_file in "$REPO_ROOT"/web/js/*.js; do
   "$NODE_BIN" --input-type=module --check < "$js_file"
 done
 
+for js_test in "$REPO_ROOT"/tests/js/*.test.mjs; do
+  [ -f "$js_test" ] || continue
+  log "Running: $NODE_BIN --test ${js_test#$REPO_ROOT/}"
+  "$NODE_BIN" --test "$js_test"
+done
+
 run_shell git diff --check
 
 log "Pre-push checks passed."
