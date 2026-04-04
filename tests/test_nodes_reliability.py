@@ -88,6 +88,23 @@ class NodesReliabilityTests(unittest.TestCase):
         self.assertIn("libopus", mux_args)
         self.assertEqual(video_format["audio_pass"], ["-c:a", "libopus"])
 
+    def test_build_audio_mux_args_adds_ffmetadata_input_for_roundtrip_payload(self):
+        video_format = {"extension": "mp4", "audio_pass": ["-c:a", "aac"]}
+        mux_args, _channels = self.nodes_mod.build_audio_mux_args(
+            video_format,
+            "silent.mp4",
+            "with-audio.mp4",
+            {"waveform": _FakeWaveform(), "sample_rate": 48000},
+            total_frames_output=12,
+            frame_rate=12,
+            metadata_path="metadata.txt",
+        )
+        self.assertIn("metadata.txt", mux_args)
+        self.assertIn("-map_metadata", mux_args)
+        self.assertEqual(mux_args[mux_args.index("-map_metadata") + 1], "2")
+        self.assertIn("-movflags", mux_args)
+        self.assertEqual(mux_args[mux_args.index("-movflags") + 1], "use_metadata_tags")
+
     def test_prune_outputs_all_option_deletes_all_selected_outputs(self):
         prune = self.nodes_mod.PruneOutputs()
         files = []

@@ -24,6 +24,7 @@ from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_wor
         gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, \
         imageOrLatent, BIGMAX, merge_filter_args, ENCODE_ARGS, floatOrInt, cached, \
         ContainsAll, debug_log
+from .video_metadata import create_ffmetadata_file
 from comfy.utils import ProgressBar
 
 if 'VHS_video_formats' not in folder_paths.folder_names_and_paths:
@@ -130,7 +131,7 @@ def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
 
-def build_audio_mux_args(video_format, file_path, output_file_with_audio_path, audio, total_frames_output, frame_rate):
+def build_audio_mux_args(video_format, file_path, output_file_with_audio_path, audio, total_frames_output, frame_rate, metadata_path=None):
     if "audio_pass" not in video_format:
         logger.warn("Selected video format does not have explicit audio support")
         video_format["audio_pass"] = ["-c:a", "libopus"]
@@ -143,8 +144,10 @@ def build_audio_mux_args(video_format, file_path, output_file_with_audio_path, a
     mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
                 "-ar", str(audio['sample_rate']), "-ac", str(channels),
                 "-f", "f32le", "-i", "-", "-c:v", "copy"] \
-                + video_format["audio_pass"] \
-                + apad + ["-shortest", output_file_with_audio_path]
+                + video_format["audio_pass"]
+    if metadata_path is not None:
+        mux_args += ["-i", metadata_path, "-map_metadata", "2", "-movflags", "use_metadata_tags"]
+    mux_args += apad + ["-shortest", output_file_with_audio_path]
     merge_filter_args(mux_args, '-af')
     return mux_args, channels
 
@@ -153,52 +156,43 @@ def ffmpeg_process(args, video_format, video_metadata, file_path, env):
     res = None
     frame_data = yield
     total_frames_output = 0
+    metadata_path = None
     if video_format.get('save_metadata', 'False') != 'False':
-        os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
-        metadata_path = os.path.join(folder_paths.get_temp_directory(), "metadata.txt")
-        #metadata from file should  escape = ; # \ and newline
-        def escape_ffmpeg_metadata(key, value):
-            value = str(value)
-            value = value.replace("\\","\\\\")
-            value = value.replace(";","\\;")
-            value = value.replace("#","\\#")
-            value = value.replace("=","\\=")
-            value = value.replace("\n","\\\n")
-            return f"{key}={value}"
-
-        with open(metadata_path, "w") as f:
-            f.write(";FFMETADATA1\n")
-            if "prompt" in video_metadata:
-                f.write(escape_ffmpeg_metadata("prompt", json.dumps(video_metadata["prompt"])) + "\n")
-            if "workflow" in video_metadata:
-                f.write(escape_ffmpeg_metadata("workflow", json.dumps(video_metadata["workflow"])) + "\n")
-            for k, v in video_metadata.items():
-                if k not in ["prompt", "workflow"]:
-                    f.write(escape_ffmpeg_metadata(k, json.dumps(v)) + "\n")
-
-        m_args = args[:1] + ["-i", metadata_path] + args[1:] + ["-metadata", "creation_time=now", "-movflags", "use_metadata_tags"]
-        with subprocess.Popen(m_args + [file_path], stderr=subprocess.PIPE,
-                              stdin=subprocess.PIPE, env=env) as proc:
-            try:
-                while frame_data is not None:
-                    proc.stdin.write(frame_data)
-                    #TODO: skip flush for increased speed
-                    frame_data = yield
-                    total_frames_output+=1
-                proc.stdin.flush()
-                proc.stdin.close()
-                res = proc.stderr.read()
-            except BrokenPipeError as e:
-                err = proc.stderr.read()
-                #Check if output file exists. If it does, the re-execution
-                #will also fail. This obscures the cause of the error
-                #and seems to never occur concurrent to the metadata issue
-                if os.path.exists(file_path):
-                    raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                            + err.decode(*ENCODE_ARGS))
-                #Res was not set
-                print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-                logger.warn("An error occurred when saving with metadata")
+        # IMPORTANT: keep this comment payload contract aligned with web/js/videoMetadataParser.js.
+        # Saved-video workflow re-import depends on the final muxed file retaining this metadata.
+        metadata_path = create_ffmetadata_file(video_metadata, folder_paths.get_temp_directory())
+    if metadata_path is not None:
+        m_args = args[:1] + ["-i", metadata_path] + args[1:] + [
+            "-map_metadata", "0",
+            "-metadata", "creation_time=now",
+            "-movflags", "use_metadata_tags",
+        ]
+        try:
+            with subprocess.Popen(m_args + [file_path], stderr=subprocess.PIPE,
+                                  stdin=subprocess.PIPE, env=env) as proc:
+                try:
+                    while frame_data is not None:
+                        proc.stdin.write(frame_data)
+                        #TODO: skip flush for increased speed
+                        frame_data = yield
+                        total_frames_output+=1
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                    res = proc.stderr.read()
+                except BrokenPipeError as e:
+                    err = proc.stderr.read()
+                    #Check if output file exists. If it does, the re-execution
+                    #will also fail. This obscures the cause of the error
+                    #and seems to never occur concurrent to the metadata issue
+                    if os.path.exists(file_path):
+                        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
+                                + err.decode(*ENCODE_ARGS))
+                    #Res was not set
+                    print(err.decode(*ENCODE_ARGS), end="", file=sys.stderr)
+                    logger.warn("An error occurred when saving with metadata")
+        finally:
+            if os.path.exists(metadata_path):
+                os.remove(metadata_path)
     if res != b'':
         with subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
                               stdin=subprocess.PIPE, env=env) as proc:
@@ -371,7 +365,7 @@ class VideoCombine:
         video_metadata = {}
         if prompt is not None:
             metadata.add_text("prompt", json.dumps(prompt))
-            video_metadata["prompt"] = json.dumps(prompt)
+            video_metadata["prompt"] = prompt
         if extra_pnginfo is not None:
             for x in extra_pnginfo:
                 metadata.add_text(x, json.dumps(extra_pnginfo[x]))
@@ -598,26 +592,34 @@ class VideoCombine:
                 # Create audio file if input was provided
                 output_file_with_audio = f"{filename}_{counter:05}-audio.{video_format['extension']}"
                 output_file_with_audio_path = os.path.join(full_output_folder, output_file_with_audio)
-                mux_args, channels = build_audio_mux_args(
-                    video_format,
-                    file_path,
-                    output_file_with_audio_path,
-                    audio,
-                    total_frames_output,
-                    frame_rate,
-                )
-                audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
-                        .numpy().tobytes()
                 try:
-                    res = subprocess.run(mux_args, input=audio_data,
-                                         env=env, capture_output=True, check=True)
-                except subprocess.CalledProcessError as e:
-                    raise Exception(
-                        "An error occured while muxing audio into the video output:\n"
-                        + f"format={video_format['extension']} codec_args={video_format.get('audio_pass')} "
-                        + f"sample_rate={audio['sample_rate']} channels={channels}\n"
-                        + e.stderr.decode(*ENCODE_ARGS)
+                    mux_metadata_path = None
+                    if video_format.get('save_metadata', 'False') != 'False':
+                        mux_metadata_path = create_ffmetadata_file(video_metadata, folder_paths.get_temp_directory())
+                    mux_args, channels = build_audio_mux_args(
+                        video_format,
+                        file_path,
+                        output_file_with_audio_path,
+                        audio,
+                        total_frames_output,
+                        frame_rate,
+                        metadata_path=mux_metadata_path,
                     )
+                    audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
+                            .numpy().tobytes()
+                    try:
+                        res = subprocess.run(mux_args, input=audio_data,
+                                             env=env, capture_output=True, check=True)
+                    except subprocess.CalledProcessError as e:
+                        raise Exception(
+                            "An error occured while muxing audio into the video output:\n"
+                            + f"format={video_format['extension']} codec_args={video_format.get('audio_pass')} "
+                            + f"sample_rate={audio['sample_rate']} channels={channels}\n"
+                            + e.stderr.decode(*ENCODE_ARGS)
+                        )
+                finally:
+                    if mux_metadata_path is not None and os.path.exists(mux_metadata_path):
+                        os.remove(mux_metadata_path)
                 if res.stderr:
                     print(res.stderr.decode(*ENCODE_ARGS), end="", file=sys.stderr)
                 if os.path.exists(file_path):

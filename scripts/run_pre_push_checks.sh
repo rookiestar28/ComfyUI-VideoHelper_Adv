@@ -184,10 +184,11 @@ run_python -m compileall videohelpersuite __init__.py scripts tests
 run_python scripts/run_unittests.py
 
 ensure_node_18
-if [ -f "$REPO_ROOT/web/js/VHS.core.js" ]; then
-  log "Running: $NODE_BIN --input-type=module --check < web/js/VHS.core.js"
-  "$NODE_BIN" --input-type=module --check < "$REPO_ROOT/web/js/VHS.core.js"
-fi
+for js_file in "$REPO_ROOT"/web/js/*.js; do
+  [ -f "$js_file" ] || continue
+  log "Running: $NODE_BIN --input-type=module --check < ${js_file#$REPO_ROOT/}"
+  "$NODE_BIN" --input-type=module --check < "$js_file"
+done
 
 run_shell git diff --check
 
