@@ -217,6 +217,31 @@ def install_nodes_dependency_stubs():
     sys.modules["videohelpersuite.batched_nodes"] = batched_nodes
 
 
+def install_load_video_dependency_stubs():
+    sys.modules["nodes"] = types.SimpleNamespace(VHSLoadFormats={})
+
+    pil_module = types.ModuleType("PIL")
+    pil_module.Image = types.SimpleNamespace(open=lambda *_a, **_k: None)
+    pil_module.ImageOps = types.SimpleNamespace(exif_transpose=lambda image: image)
+    sys.modules["PIL"] = pil_module
+
+    cv2_module = types.ModuleType("cv2")
+    cv2_module.CAP_PROP_FPS = 5
+    cv2_module.CAP_PROP_FRAME_WIDTH = 3
+    cv2_module.CAP_PROP_FRAME_HEIGHT = 4
+    cv2_module.CAP_PROP_FRAME_COUNT = 7
+    cv2_module.COLOR_BGR2RGB = 1
+    cv2_module.VideoCapture = lambda *_a, **_k: None
+    cv2_module.cvtColor = lambda frame, _code: frame
+    sys.modules["cv2"] = cv2_module
+
+    if "psutil" not in sys.modules:
+        psutil_module = types.ModuleType("psutil")
+        psutil_module.virtual_memory = lambda: types.SimpleNamespace(available=0)
+        psutil_module.swap_memory = lambda: types.SimpleNamespace(free=0)
+        sys.modules["psutil"] = psutil_module
+
+
 def import_fresh(module_name):
     purge_modules(module_name)
     return importlib.import_module(module_name)

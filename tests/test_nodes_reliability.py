@@ -65,6 +65,9 @@ class NodesReliabilityTests(unittest.TestCase):
             "comfy",
             "torch",
             "nodes",
+            "PIL",
+            "cv2",
+            "psutil",
         )
         self.paths = install_base_stubs(self.workspace.path)
         install_nodes_dependency_stubs()

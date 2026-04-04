@@ -589,6 +589,8 @@ class LoadVideoFFmpegUpload:
     def load_video(self, **kwargs):
         kwargs['video'] = folder_paths.get_annotated_filepath(strip_path(kwargs['video']))
         image, _, audio, video_info =  load_video(**kwargs, generator=ffmpeg_frame_generator)
+        if isinstance(image, dict):
+            return (image, None, audio, video_info)
         if image.size(3) == 4:
             return (image[:,:,:,:3], 1-image[:,:,:,3], audio, video_info)
         return (image, torch.zeros(image.size(0), 64, 64, device="cpu"), audio, video_info)
