@@ -3,6 +3,7 @@ import folder_paths
 import os
 import subprocess
 import re
+import tempfile
 from contextlib import suppress
 
 import asyncio
@@ -53,6 +54,12 @@ def decode_process_output(payload):
     return payload.decode(*ENCODE_ARGS)
 
 
+def cleanup_temp_paths(paths):
+    for path in paths or ():
+        with suppress(FileNotFoundError, OSError):
+            os.remove(path)
+
+
 async def cleanup_preview_process(proc, *, kill=False, label="preview"):
     if proc is None:
         return
@@ -89,7 +96,7 @@ async def run_preview_prepass(*args):
         await cleanup_preview_process(proc, label="preview_prepass")
 
 
-async def stream_preview_response(request, *, args, filename, content_type, debug_event):
+async def stream_preview_response(request, *, args, filename, content_type, debug_event, cleanup_paths=None):
     proc = None
     response = web.StreamResponse()
     response.content_type = content_type
@@ -124,6 +131,7 @@ async def stream_preview_response(request, *, args, filename, content_type, debu
             kill=disconnected,
             label=filename,
         )
+        cleanup_temp_paths(cleanup_paths)
         if prepared and not disconnected:
             with suppress(Exception):
                 await response.write_eof()
@@ -138,6 +146,7 @@ async def view_video(request):
     if isinstance(path_res, web.Response):
         return path_res
     file, filename, output_dir = path_res
+    cleanup_paths = []
 
     if ffmpeg_path is None:
         #Don't just return file, that provides  arbitrary read access to any file
@@ -148,17 +157,27 @@ async def view_video(request):
     frame_rate = parse_float(query, 'frame_rate', 8.0, 0.0)
     if query.get('format', 'video') == "folder":
         os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
-        concat_file = os.path.join(folder_paths.get_temp_directory(), "image_sequence_preview.txt")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=folder_paths.get_temp_directory(),
+            prefix="vhs-folder-preview-",
+            suffix=".txt",
+            delete=False,
+        ) as handle:
+            concat_file = handle.name
         skip_first_images = parse_int(query, 'skip_first_images', 0, 0)
         select_every_nth = parse_int(query, 'select_every_nth', 1, 1)
         valid_images = get_sorted_dir_files_from_directory(file, skip_first_images, select_every_nth, FolderOfImages.IMG_EXTENSIONS)
         if len(valid_images) == 0:
+            cleanup_temp_paths([concat_file])
             return error_response(204, "No valid images were found for folder preview.")
-        with open(concat_file, "w") as f:
+        with open(concat_file, "w", encoding="utf-8") as f:
             f.write("ffconcat version 1.0\n")
             for path in valid_images:
                 f.write("file '" + os.path.abspath(path) + "'\n")
                 f.write("duration 0.125\n")
+        cleanup_paths.append(concat_file)
         in_args = ["-safe", "0", "-i", concat_file]
     else:
         in_args = ["-i", file]
@@ -179,6 +198,7 @@ async def view_video(request):
     if returncode not in (0, None):
         message = decode_process_output(res_stderr)
         debug_log("view_video_prepass_failed", filename=filename, returncode=returncode, stderr=message)
+        cleanup_temp_paths(cleanup_paths)
         return error_response(500, f"Failed to inspect media for preview: {filename}")
 
     match = re.search(': Video: (\\w+) .+, (\\d+) fps,', decode_process_output(res_stderr))
@@ -241,6 +261,7 @@ async def view_video(request):
         filename=filename,
         content_type='video/webm',
         debug_event="view_video_preview",
+        cleanup_paths=cleanup_paths,
     )
 
 @server.PromptServer.instance.routes.get("/vhs/viewaudio")
