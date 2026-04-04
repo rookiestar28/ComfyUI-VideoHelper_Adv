@@ -135,8 +135,12 @@ download_history = {}
 def try_download_video(url):
     if ytdl_path is None:
         return None
-    if url in download_history:
-        return download_history[url]
+    cached_file = download_history.get(url)
+    # IMPORTANT: temp downloads can disappear between runs; never reuse a missing cached path.
+    if cached_file is not None:
+        if os.path.isfile(cached_file):
+            return cached_file
+        download_history.pop(url, None)
     os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
     #Format information could be added to only download audio for Load Audio,
     #but this gets hairy if same url is also used for video.
@@ -147,11 +151,13 @@ def try_download_video(url):
                               "-P", folder_paths.get_temp_directory(), url],
                              capture_output=True, check=True)
         #strip newline
-        file = res.stdout.decode(*ENCODE_ARGS)[:-1]
+        file = res.stdout.decode(*ENCODE_ARGS).strip()
     except subprocess.CalledProcessError as e:
         raise Exception("An error occurred in the yt-dl process:\n" \
                 + e.stderr.decode(*ENCODE_ARGS))
-        file = None
+    if not file or not os.path.isfile(file):
+        download_history.pop(url, None)
+        raise Exception("yt-dl did not produce a reusable downloaded file path.")
     download_history[url] = file
     return file
 
