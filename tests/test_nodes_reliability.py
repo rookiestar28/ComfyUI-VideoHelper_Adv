@@ -102,11 +102,32 @@ class NodesReliabilityTests(unittest.TestCase):
             frame_rate=12,
             metadata_path="metadata.txt",
         )
-        self.assertIn("metadata.txt", mux_args)
+        metadata_index = mux_args.index("metadata.txt")
+        copy_index = mux_args.index("-c:v")
         self.assertIn("-map_metadata", mux_args)
         self.assertEqual(mux_args[mux_args.index("-map_metadata") + 1], "2")
         self.assertIn("-movflags", mux_args)
         self.assertEqual(mux_args[mux_args.index("-movflags") + 1], "use_metadata_tags")
+        self.assertEqual(mux_args[metadata_index - 1], "-i")
+        self.assertEqual(mux_args[metadata_index - 2], "ffmetadata")
+        self.assertEqual(mux_args[metadata_index - 3], "-f")
+        self.assertLess(metadata_index, copy_index)
+
+    def test_build_audio_mux_args_never_places_metadata_input_after_output_codecs(self):
+        video_format = {"extension": "mp4", "audio_pass": ["-c:a", "aac"]}
+        mux_args, _channels = self.nodes_mod.build_audio_mux_args(
+            video_format,
+            "silent.mp4",
+            "with-audio.mp4",
+            {"waveform": _FakeWaveform(), "sample_rate": 44100},
+            total_frames_output=24,
+            frame_rate=24,
+            metadata_path="metadata.txt",
+        )
+        codec_index = mux_args.index("-c:v")
+        metadata_flag_index = mux_args.index("-f", mux_args.index("-i", mux_args.index("-i") + 1) + 1)
+        self.assertLess(metadata_flag_index, codec_index)
+        self.assertEqual(mux_args[metadata_flag_index:metadata_flag_index + 4], ["-f", "ffmetadata", "-i", "metadata.txt"])
 
     def test_prune_outputs_all_option_deletes_all_selected_outputs(self):
         prune = self.nodes_mod.PruneOutputs()

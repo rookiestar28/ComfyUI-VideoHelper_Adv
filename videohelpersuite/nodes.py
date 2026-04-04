@@ -141,12 +141,21 @@ def build_audio_mux_args(video_format, file_path, output_file_with_audio_path, a
         apad = []
     else:
         apad = ["-af", "apad=whole_dur="+str(min_audio_dur)]
-    mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
-                "-ar", str(audio['sample_rate']), "-ac", str(channels),
-                "-f", "f32le", "-i", "-", "-c:v", "copy"] \
-                + video_format["audio_pass"]
+    mux_args = [
+        ffmpeg_path, "-v", "error", "-n",
+        "-i", file_path,
+        "-ar", str(audio['sample_rate']), "-ac", str(channels),
+        "-f", "f32le", "-i", "-",
+    ]
+    metadata_input_index = None
     if metadata_path is not None:
-        mux_args += ["-i", metadata_path, "-map_metadata", "2", "-movflags", "use_metadata_tags"]
+        # IMPORTANT: ffmetadata must remain in the input section; placing it after output codec args
+        # makes ffmpeg treat -c:v copy as an input decoder option and breaks audio muxing.
+        mux_args += ["-f", "ffmetadata", "-i", metadata_path]
+        metadata_input_index = 2
+    mux_args += ["-c:v", "copy"] + video_format["audio_pass"]
+    if metadata_input_index is not None:
+        mux_args += ["-map_metadata", str(metadata_input_index), "-movflags", "use_metadata_tags"]
     mux_args += apad + ["-shortest", output_file_with_audio_path]
     merge_filter_args(mux_args, '-af')
     return mux_args, channels
